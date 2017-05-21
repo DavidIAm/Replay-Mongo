@@ -4,7 +4,7 @@ use warnings FATAL => 'all';
 use ExtUtils::MakeMaker;
 
 WriteMakefile(
-    NAME               => 'Replay',
+    NAME               => 'Replay::Mongo',
     AUTHOR             => q{David Ihnen <davidihnen@gmail.com>},
     VERSION_FROM       => 'lib/Replay/Role/MongoDB.pm',
     ABSTRACT           => 'Mongo support for the Replay framework',
