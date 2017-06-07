@@ -17,14 +17,19 @@ package Replay::Role::MongoDB;
 
 use Moose::Role;
 use Carp qw/croak confess carp cluck/;
+use Replay::StorageEngine::Lock;
+use Data::Dumper;
 use MongoDB;
 use MongoDB::OID;
 use JSON;
+use Try::Tiny;
 requires(
-    qw( _build_dbname
+    qw(_build_mongo
+        _build_db
+        _build_dbname
         _build_dbauthdb
         _build_dbuser
-        _build_dbpass )
+        _build_dbpass)
 );
 
 our $VERSION = q(0.01);
@@ -42,13 +47,6 @@ has mongo => (
     lazy    => 1,
 );
 
-sub _build_db {          ## no critic (ProhibitUnusedPrivateSubroutines)
-    my ($self) = @_;
-    my $config = $self->config;
-    my $db     = $self->mongo->get_database( $self->dbname );
-    return $db;
-}
-
 sub _build_mongo {    ## no critic (ProhibitUnusedPrivateSubroutines)
     my ($self) = @_;
     my $db = MongoDB::MongoClient->new(
@@ -59,9 +57,84 @@ sub _build_mongo {    ## no critic (ProhibitUnusedPrivateSubroutines)
     return $db;
 }
 
+sub checkout_record {
+    my ( $self, $lock ) = @_;
+    my $idkey = $lock->idkey;
+
+    # try to get lock
+    # # right record: idkey matches
+    # # unlocked OR expired
+    # # # unlocked - locked element does not exist
+    # # # expired - locked is the signature
+    # # #         - lock expire epoch is gt current time
+    # # #        OR lockExpireEpoch does not exist
+    # make sure we have an index for this collection
+    $self->collection($idkey)
+        ->indexes->create_one( [ idkey => 1 ], { unique => 1 } );
+
+    # Happy path - cleanly grab the lock
+    try {
+        my $lockresult = $self->collection($idkey)->update_one(
+            {   idkey => $idkey->cubby,
+                q^$^
+                    . 'or' => [
+                    { locked => { q^$^ . 'exists' => 0 } },
+                    { locked => $lock->locked }
+                    ]
+            },
+            {   q^$^
+                    . 'set' => {
+                    locked          => $lock->locked,
+                    lockExpireEpoch => $lock->lockExpireEpoch,
+                    },
+                q^$^ . 'setOnInsert' => { IdKey => $idkey->marshall },
+            },
+            { upsert => 1, returnNewDocument => 1, },
+        );
+    }
+    catch {
+        # Unhappy - didn't get it.  Let somebody else handle the situation
+        if ( $_->isa('MongoDB::DuplicateKeyError') ) {
+            my $relock = $self->relock_expired(
+                Replay::StorageEngine::Lock->prospective(
+                    $idkey, $lock->timeout
+                )
+            );
+            my $current = $self->lockreport( $lock->idkey );
+            if ($relock->matches($current) && !$relock->is_expired) {
+                return $relock;
+            }
+            return Replay::StorageEngine::Lock->empty($lock->idkey);
+        }
+        else {
+            croak $_;
+        }
+    };
+
+    return $lock;
+
+    # boxes collection
+    #
+    # absorb:
+    # create new document in boxes: {idkey:, atom:, state:'inbox'}
+    #
+    # checkout:
+    # lock the record
+    # update boxes {idkey: , state:'inbox'} to { {idkey: # , state: 'desktop'}
+    # }
+    #
+    # reduce:
+    # retrieve list { idkey: , state: 'desktop' }
+    #
+    # checkin:
+    # update canonical
+    # delete boxes {idkey: , state:'desktop'}
+    # unlock the record
+
+}
+
 sub collection {
     my ( $self, $idkey ) = @_;
-    use Carp qw/confess/;
     confess 'WHAT IS THIS ' . $idkey if !ref $idkey;
     my $name = $idkey->collection();
     return $self->db->get_collection($name);
@@ -71,6 +144,101 @@ sub document {
     my ( $self, $idkey ) = @_;
     return $self->collection($idkey)->find( { idkey => $idkey->cubby } )
         ->next || $self->new_document($idkey);
+}
+
+sub lockreport {
+    my ( $self, $idkey ) = @_;
+    croak 'idkey for lockreport must be passed' if !$idkey;
+
+    my $found
+        = $self->db->get_collection( $idkey->collection )
+        ->find_one( { idkey => $idkey->cubby },
+        { locked => 1, lockExpireEpoch => 1, } )
+        || {};
+
+    return Replay::StorageEngine::Lock->new(
+        idkey => $idkey,
+        (   $found->{locked}
+            ? ( locked          => $found->{locked},
+                lockExpireEpoch => $found->{lockExpireEpoch}
+                )
+            : ()
+        ),
+    );
+}
+
+sub relock_expired {
+    my ( $self, $relock ) = @_;
+    my $idkey = $relock->idkey;
+
+    # Lets try to get an expire lock, if it has timed out
+    my $r = $self->collection($idkey)->update_one(
+        {   idkey  => $idkey->cubby,
+            locked => { q^$^ . 'exists' => 1 },
+            lockExpireEpoch => { q^$^ . 'lt'     => time },
+        },
+        {   q^$^
+                . 'set' => {
+                locked          => $relock->locked,
+                lockExpireEpoch => $relock->lockExpireEpoch,
+                },
+        }
+    );
+    return $relock;
+}
+
+sub revert_this_record {
+    my ( $self, $lock ) = @_;
+
+    my $current = $self->lockreport( $lock->idkey );
+    croak " $$ cannot revert record is not locked" if !$lock->locked;
+    croak " $$  cannot revert because this is not my lock - sig "
+        . $current->locked
+        . ' lock '
+        . $lock->locked . ' or '
+        if !$lock->matches($current);
+    croak " $$ cannot revert because this lock is expired "
+        . ( $lock->{lockExpireEpoch} - time )
+        . ' seconds overdue.'
+        if $lock->is_expired;
+
+    # reabsorb all of the desktop atoms into the document
+    my $r = $self->reabsorb($lock);
+
+    my $unlock = $self->collection( $lock->idkey )->update_one(
+        { idkey => $lock->idkey->cubby, locked => $lock->locked },
+        { q^$^ . 'unset' => { locked => 1, lockExpireEpoch => 1, } },
+    );
+
+    return $lock;
+}
+
+sub update_and_unlock {
+    my ( $self, $lock, $state ) = @_;
+    my @unsetcanon = ();
+    if ($state) {
+        delete $state->{_id};    # cannot set _id!
+        delete $state->{lockExpireEpoch}
+            ;                    # there is no more expire time on checkin
+        delete $state->{locked}
+            ;    # there is no more locked signature on checkin
+        if ( @{ $state->{canonical} || [] } == 0 ) {
+            delete $state->{canonical};
+            @unsetcanon = ( canonical => 1 );
+        }
+        $self->clear_desktop($lock);
+    }
+    my ( $package, $filename, $line ) = caller;
+    my $newstate = $self->collection( $lock->idkey )->update_one(
+        { idkey => $lock->idkey->cubby, locked => $lock->locked },
+        {   ( $state ? ( q^$^ . 'set' => $state ) : () ),
+            q^$^
+                . 'unset' =>
+                { lockExpireEpoch => 1, locked => 1, @unsetcanon }
+        },
+        { upsert => 0 }
+    );
+    return $self->retrieve( $lock->idkey );
 }
 
 1;
@@ -110,47 +278,43 @@ implements
 
 =over 4
 
-=head2 _build_mongo 
+=head2 _build_mongo
 
 build the mongo connection handle
 
-=head2 checkout_record 
+=head2 checkout_record
 
 given an IdKey, lock the document and return the uuid for the lock
 
-=head2 collection 
+=head2 collection
 
 given an IdKey, return the collection it will be found in
 
-=head2 document 
+=head2 document
 
 given an IdKey, retrieve the document
 
-=head2 lockreport 
+=head2 lockreport
 
 given an IdKey, return a summary of its lock state
 
-=head2 relock 
+=head2 relock
 
-given an IdKey and a uuid, relock the record - presumably so that 
+given an IdKey and a uuid, relock the record - presumably so that
 the timeout doesn't expire
 
-=head2 relock_expired 
+=head2 relock_expired
 
 given an IdKey to a lock with an expired record, take over the lock
 
-=head2 relock_i_match_with 
-
-unclear how this varies from relock...
-
-=head2 revert_this_record 
+=head2 revert_this_record
 
 given an idkey to a locked record and its uuid key, revert this to its
 unchecked out, unchanged state
 
-=head2 update_and_unlock 
+=head2 update_and_unlock
 
-given an idkey to a locked record and its uuid key and a new 
+given an idkey to a locked record and its uuid key and a new
 canonical state, update canonical state clear desktop and unlock
 
 =head1 AUTHOR
@@ -175,10 +339,10 @@ Nothing to report
 
 =head1 BUGS AND LIMITATIONS
 
-Please report any bugs or feature requests to C<bug-replay at rt.cpan.org>, 
-or through the web interface at 
-L<http://rt.cpan.org/NoAuth/ReportBug.html?Queue=Replay>.  I will be 
-notified, and then you'll automatically be notified of progress on your 
+Please report any bugs or feature requests to C<bug-replay at rt.cpan.org>,
+or through the web interface at
+L<http://rt.cpan.org/NoAuth/ReportBug.html?Queue=Replay>.  I will be
+notified, and then you'll automatically be notified of progress on your
 bug as I make changes .
 
 =head1 SUPPORT
@@ -211,7 +375,7 @@ L<http://search.cpan.org/dist/Replay/>
 =back
 
 
-=head1 ACKNOWLEDGEMENTS
+=head1 ACKNOWLEDGMENTS
 
 
 =head1 LICENSE AND COPYRIGHT
